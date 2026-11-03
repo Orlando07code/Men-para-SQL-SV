@@ -1,0 +1,201 @@
+<#
+.SYNOPSIS
+    Script definitivo con búsqueda dinámica de columnas para actualizar estatus de jobs en Excel.
+#>
+
+Stop-Process -Name "EXCEL" -Force -ErrorAction SilentlyContinue
+
+# --- CONFIGURACIÓN ---
+$ServerInstance = "10.10.50.30"
+$CredPath = "C:\Users\practicas1\Documents\PruebaLocal\MantenimientoDesarrollo\sql_cred.dat"
+
+if (!(Test-Path $CredPath)) {
+    Write-Host "[ERROR] No se encontró el archivo de credenciales: $CredPath" -ForegroundColor Red
+    exit
+}
+
+$secure = Get-Content -Path $CredPath | ConvertTo-SecureString
+$json   = [System.Net.NetworkCredential]::new("", $secure).Password
+$Cred   = $json | ConvertFrom-Json
+
+$ExcelPath = "C:\Users\practicas1\Documents\PruebaLocal\MantenimientoDesarrollo\Mantenimientos de Base de datosDes.xlsx"
+$TempExcelPath = "$env:TEMP\Mantenimiento_Temp.xlsx"
+
+# --- CONFIGURACIÓN DE MESES ---
+$mesesEspanol = @(
+    "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+)
+
+$fechaActual = Get-Date
+$mesActualNum = $fechaActual.Month
+$mesAnteriorNum = if ($mesActualNum -eq 1) { 12 } else { $mesActualNum - 1 }
+
+$SheetNameActual = $mesesEspanol[$mesActualNum]
+$SheetNameAnterior = $mesesEspanol[$mesAnteriorNum]
+
+Write-Host "[INFO] Mes actual: $SheetNameActual | Mes anterior (cierre): $SheetNameAnterior" -ForegroundColor Cyan
+
+if (Test-Path $TempExcelPath) {
+    Remove-Item -Path $TempExcelPath -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "[INFO] Preparando archivo local..." -ForegroundColor Cyan
+if (!(Test-Path $ExcelPath)) {
+    Write-Host "[ERROR] No se encontró el archivo en: $ExcelPath" -ForegroundColor Red
+    exit
+}
+
+Copy-Item -Path $ExcelPath -Destination $TempExcelPath -Force
+Set-ItemProperty -Path $TempExcelPath -Name IsReadOnly -Value $false
+
+Write-Host "[INFO] Conectando a SQL Server..." -ForegroundColor Cyan
+
+try {
+    $Builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $Builder["Data Source"]            = $ServerInstance
+    $Builder["Initial Catalog"]        = "msdb"
+    $Builder["User ID"]                = $Cred.User
+    $Builder["Password"]               = $Cred.Password
+    $Builder["TrustServerCertificate"] = $true
+
+    $Connection = New-Object System.Data.SqlClient.SqlConnection($Builder.ConnectionString)
+    $Connection.Open()
+    $Connection = New-Object System.Data.SqlClient.SqlConnection($Builder.ConnectionString)
+    $Connection.Open()
+    
+    
+    $CmdServer = $Connection.CreateCommand()
+    $CmdServer.CommandText = "SELECT @@SERVERNAME"
+    $NombreServidor = $CmdServer.ExecuteScalar()
+    Write-Host "[INFO] Conexión establecida con el servidor: $NombreServidor ($ServerInstance)" -ForegroundColor Green
+    [Console]::Beep(800, 400)
+
+    
+
+    $Query = "EXEC msdb.dbo.ObtenerStatusJobs_Alias_Prefijo"
+    $Command = $Connection.CreateCommand()
+    $Command.CommandText = $Query
+    
+    $Adapter = New-Object System.Data.SqlClient.SqlDataAdapter($Command)
+    $Dataset = New-Object System.Data.DataSet
+    [void]$Adapter.Fill($Dataset)
+    
+    $SqlData = $Dataset.Tables[0]
+    $Connection.Close()
+}
+catch {
+    Write-Host "[ERROR] Error en SQL: $_" -ForegroundColor Red
+    exit
+}
+
+if (!$SqlData -or $SqlData.Rows.Count -eq 0) {
+    Write-Host "[ADVERTENCIA] El SP no devolvió registros." -ForegroundColor Yellow
+    exit
+}
+
+Write-Host "[INFO] Actualizando Excel..." -ForegroundColor Cyan
+$ExcelApp = New-Object -ComObject Excel.Application
+$ExcelApp.Visible = $false
+$ExcelApp.DisplayAlerts = $false
+$Actualizados = 0
+
+try {
+    $Workbook = $ExcelApp.Workbooks.Open($TempExcelPath)
+    $WorksheetsCache = @{}
+    $ColumnaMantenimientoCache = @{}
+
+    foreach ($Registro in $SqlData) {
+        $JobName = [string]$Registro.NombreJob
+        $Estatus = [string]$Registro.Estatus
+        $rawDia  = [string]$Registro.Dia
+
+        if ([string]::IsNullOrWhiteSpace($rawDia)) { continue }
+        $diaInt = [int]($rawDia.Trim())
+
+        $targetSheetName = if ($diaInt -gt $fechaActual.Day) { $SheetNameAnterior } else { $SheetNameActual }
+
+        if (-not $WorksheetsCache.ContainsKey($targetSheetName)) {
+            $foundSheet = $null
+            foreach ($sheet in $Workbook.Sheets) {
+                if ($sheet.Name.Trim().ToLower() -eq $targetSheetName.Trim().ToLower()) {
+                    $foundSheet = $sheet
+                    break
+                }
+            }
+
+            if ($null -eq $foundSheet) {
+                Write-Host "[ADVERTENCIA] No se encontró ninguna hoja que coincida con '$targetSheetName'." -ForegroundColor Yellow
+                continue
+            }
+            $WorksheetsCache[$targetSheetName] = $foundSheet
+        }
+        
+        $Worksheet = $WorksheetsCache[$targetSheetName]
+
+        # Encontrar dinámicamente en qué columna está 'Mantenimiento' en esta hoja específica
+        if (-not $ColumnaMantenimientoCache.ContainsKey($targetSheetName)) {
+            $colMantenimiento = $null
+            $UsedRange = $Worksheet.UsedRange
+            $ColsCount = $UsedRange.Column + $UsedRange.Columns.Count - 1
+            
+            for ($c = 1; $c -le $ColsCount; $c++) {
+                $headerName = [string]$Worksheet.Cells.Item(1, $c).Value2
+                if ($headerName.Trim().ToLower() -eq "mantenimiento") {
+                    $colMantenimiento = $c
+                    break
+                }
+            }
+            if ($null -eq $colMantenimiento) { $colMantenimiento = 2 } # Fallback a columna 2
+            $ColumnaMantenimientoCache[$targetSheetName] = $colMantenimiento
+        }
+
+        $colJobIdx = $ColumnaMantenimientoCache[$targetSheetName]
+        $UsedRange2 = $Worksheet.UsedRange
+        $RowsCount = $UsedRange2.Row + $UsedRange2.Rows.Count - 1
+        $ColsCount = $UsedRange2.Column + $UsedRange2.Columns.Count - 1
+
+        for ($r = 2; $r -le $RowsCount; $r++) {
+            $cellVal = [string]$Worksheet.Cells.Item($r, $colJobIdx).Value2
+            if ($cellVal -eq $JobName) {
+                for ($col = 1; $col -le $ColsCount; $col++) {
+                    $headerVal = $Worksheet.Cells.Item(1, $col).Value2
+                    if ($null -eq $headerVal) { continue }
+
+                    $headerStr = if ($headerVal -is [double] -or $headerVal -is [int]) {
+                        [DateTime]::FromOADate($headerVal).ToString("d/M/yyyy")
+                    } else {
+                        [string]$headerVal
+                    }
+
+                    $headerDay = $headerStr.Split('/')[0].Trim()
+
+                    if ($headerDay -eq $rawDia.Trim()) {
+                        $currentVal = [string]$Worksheet.Cells.Item($r, $col).Value2
+                        if ([string]::IsNullOrWhiteSpace($currentVal)) {
+                            $Worksheet.Cells.Item($r, $col).Value2 = $Estatus
+                            Write-Host "  -> [RELLENADO] [$($Worksheet.Name)] Job '$JobName' | Día $rawDia -> $Estatus" -ForegroundColor Green
+                            $Actualizados++
+                        }
+                        break
+                    }
+                }
+                break
+            }
+        }
+    }
+
+    $Workbook.Save()
+    $Workbook.Close($true)
+    $ExcelApp.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ExcelApp) | Out-Null
+}
+catch {
+    Write-Host "[ERROR] Error COM: $_" -ForegroundColor Red
+    $ExcelApp.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ExcelApp) | Out-Null
+    exit
+}
+
+Copy-Item -Path $TempExcelPath -Destination $ExcelPath -Force
+Write-Host "[EXITO] Proceso finalizado. Celdas actualizadas: $Actualizados" -ForegroundColor Cyan
